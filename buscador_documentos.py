@@ -2,9 +2,9 @@
 Aplicación de Búsqueda en Documentos con OCR
 =============================================
 Autor: Sistema de Desarrollo
-Versión: 2.0.0
+Versión: 2.1.0
 Descripción: Aplicación GUI para buscar texto en documentos Word, PDF, Excel, TXT, HTML, PHP
-             Incluye soporte OCR para PDFs escaneados/imágenes
+             Incluye soporte OCR para PDFs escaneados/imágenes con configuración persistente
 
 Estándares aplicados:
 - PEP 8: Formato y convenciones de código Python
@@ -15,12 +15,13 @@ Estándares aplicados:
 """
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, scrolledtext
 from pathlib import Path
 import threading
 from typing import List, Dict
 import os
 import sys
+import json
 
 # Librerías para lectura de documentos
 try:
@@ -51,6 +52,56 @@ except ImportError:
     OCR_AVAILABLE = False
 
 
+class ConfigManager:
+    """
+    Gestor de configuración persistente.
+    Guarda y carga configuración en archivo JSON.
+    """
+    
+    def __init__(self):
+        """Inicializa el gestor de configuración."""
+        self.config_file = Path.home() / '.doc_searcher_config.json'
+        self.config = self._load_config()
+    
+    def _load_config(self) -> dict:
+        """
+        Carga configuración desde archivo.
+        
+        Returns:
+            Diccionario con configuración
+        """
+        if self.config_file.exists():
+            try:
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"Error cargando configuración: {e}")
+        
+        return {}
+    
+    def save_config(self, config: dict):
+        """
+        Guarda configuración en archivo.
+        
+        Args:
+            config: Diccionario con configuración a guardar
+        """
+        try:
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2)
+        except Exception as e:
+            print(f"Error guardando configuración: {e}")
+    
+    def get(self, key: str, default=None):
+        """Obtiene valor de configuración."""
+        return self.config.get(key, default)
+    
+    def set(self, key: str, value):
+        """Establece valor de configuración y guarda."""
+        self.config[key] = value
+        self.save_config(self.config)
+
+
 class DocumentSearcher:
     """
     Clase responsable de la búsqueda de texto en documentos.
@@ -63,71 +114,134 @@ class DocumentSearcher:
     # Constante: extensiones soportadas
     SUPPORTED_EXTENSIONS = {'.txt', '.docx', '.pdf', '.xlsx', '.xls', '.html', '.htm', '.php'}
     
-    def __init__(self):
-        """Inicializa el buscador con configuración por defecto."""
+    def __init__(self, config_manager: ConfigManager):
+        """
+        Inicializa el buscador con configuración.
+        
+        Args:
+            config_manager: Gestor de configuración
+        """
+        self.config_manager = config_manager
         self.results: List[Dict[str, str]] = []
         self.search_cancelled = False
         self.use_ocr = False
         self.tesseract_path = None
         self.poppler_path = None
-        self._configure_tesseract()
+        self.debug_callback = None
+        self._load_ocr_config()
     
-    def _configure_tesseract(self):
-        """Configura las rutas de Tesseract y Poppler si están disponibles."""
+    def _load_ocr_config(self):
+        """Carga configuración de OCR desde archivo."""
+        self.tesseract_path = self.config_manager.get('tesseract_path')
+        self.poppler_path = self.config_manager.get('poppler_path')
+        
+        if self.tesseract_path and OCR_AVAILABLE:
+            pytesseract.pytesseract.tesseract_cmd = self.tesseract_path
+        
+        # Si no hay configuración guardada, buscar en ubicaciones comunes
+        if not self.tesseract_path or not self.poppler_path:
+            self._auto_detect_paths()
+    
+    def _auto_detect_paths(self):
+        """Detecta automáticamente rutas de Tesseract y Poppler."""
         if not OCR_AVAILABLE:
             return
         
         # Rutas comunes de Tesseract en Windows
-        common_tesseract_paths = [
-            r'C:\Program Files\Tesseract-OCR\tesseract.exe',
-            r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
-            r'C:\Tesseract-OCR\tesseract.exe',
-        ]
-        
-        # Intentar encontrar Tesseract
-        for path in common_tesseract_paths:
-            if os.path.exists(path):
-                self.tesseract_path = path
-                pytesseract.pytesseract.tesseract_cmd = path
-                break
+        if not self.tesseract_path:
+            common_tesseract_paths = [
+                r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+                r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+                r'C:\Tesseract-OCR\tesseract.exe',
+            ]
+            
+            for path in common_tesseract_paths:
+                if os.path.exists(path):
+                    self.tesseract_path = path
+                    pytesseract.pytesseract.tesseract_cmd = path
+                    self.config_manager.set('tesseract_path', path)
+                    break
         
         # Rutas comunes de Poppler en Windows
-        common_poppler_paths = [
-            r'C:\Program Files\poppler\Library\bin',
-            r'C:\Program Files (x86)\poppler\Library\bin',
-            r'C:\poppler\Library\bin',
-            r'C:\poppler-24.08.0\Library\bin',
-        ]
-        
-        for path in common_poppler_paths:
-            if os.path.exists(path):
-                self.poppler_path = path
-                break
+        if not self.poppler_path:
+            common_poppler_paths = [
+                r'C:\Program Files\poppler\Library\bin',
+                r'C:\Program Files (x86)\poppler\Library\bin',
+                r'C:\poppler\Library\bin',
+            ]
+            
+            # Buscar también en C:\TMP
+            import glob
+            tmp_poppler = glob.glob(r'C:\TMP\*\poppler-*\Library\bin')
+            common_poppler_paths.extend(tmp_poppler)
+            
+            for path in common_poppler_paths:
+                if os.path.exists(path):
+                    self.poppler_path = path
+                    self.config_manager.set('poppler_path', path)
+                    break
     
-    def set_tesseract_path(self, path: str):
+    def set_tesseract_path(self, path: str) -> bool:
         """
         Configura manualmente la ruta de Tesseract.
         
         Args:
             path: Ruta al ejecutable de Tesseract
+            
+        Returns:
+            True si la ruta es válida
         """
         if os.path.exists(path):
             self.tesseract_path = path
             pytesseract.pytesseract.tesseract_cmd = path
+            self.config_manager.set('tesseract_path', path)
             return True
         return False
     
-    def set_poppler_path(self, path: str):
+    def set_poppler_path(self, path: str) -> bool:
         """
         Configura manualmente la ruta de Poppler.
         
         Args:
             path: Ruta al directorio bin de Poppler
+            
+        Returns:
+            True si la ruta es válida
         """
         if os.path.exists(path):
             self.poppler_path = path
+            self.config_manager.set('poppler_path', path)
             return True
         return False
+    
+    def test_ocr_setup(self) -> tuple:
+        """
+        Verifica que OCR esté configurado correctamente.
+        
+        Returns:
+            Tupla (éxito: bool, mensaje: str)
+        """
+        if not OCR_AVAILABLE:
+            return False, "Librerías OCR no instaladas (pytesseract, pdf2image, pillow)"
+        
+        if not self.tesseract_path or not os.path.exists(self.tesseract_path):
+            return False, "Tesseract no encontrado o ruta inválida"
+        
+        if not self.poppler_path or not os.path.exists(self.poppler_path):
+            return False, "Poppler no encontrado o ruta inválida"
+        
+        # Verificar que Tesseract funcione
+        try:
+            version = pytesseract.get_tesseract_version()
+            return True, f"OCR configurado correctamente (Tesseract v{version})"
+        except Exception as e:
+            return False, f"Error al ejecutar Tesseract: {str(e)}"
+    
+    def _debug_log(self, message: str):
+        """Envía mensaje de debug al callback si existe."""
+        if self.debug_callback:
+            self.debug_callback(message)
+        print(f"[DEBUG] {message}")
     
     def search_in_directory(self, directory: str, search_term: str, 
                           case_sensitive: bool = False,
@@ -163,9 +277,14 @@ class DocumentSearcher:
         # Normalizar término de búsqueda si no es case-sensitive
         normalized_term = search_term if case_sensitive else search_term.lower()
         
+        self._debug_log(f"Iniciando búsqueda de '{search_term}' en {directory}")
+        self._debug_log(f"OCR activado: {use_ocr}")
+        
         # Obtener todos los archivos soportados
         files_to_search = self._get_supported_files(directory_path)
         total_files = len(files_to_search)
+        
+        self._debug_log(f"Archivos a procesar: {total_files}")
         
         if total_files == 0:
             return self.results
@@ -176,14 +295,20 @@ class DocumentSearcher:
                 break
                 
             try:
+                self._debug_log(f"Procesando [{index}/{total_files}]: {file_path.name}")
                 content = self._extract_text_from_file(file_path)
                 
                 if content:
+                    text_length = len(content)
+                    self._debug_log(f"  Texto extraído: {text_length} caracteres")
+                    
                     normalized_content = content if case_sensitive else content.lower()
                     
                     if normalized_term in normalized_content:
                         # Contar ocurrencias
                         occurrences = normalized_content.count(normalized_term)
+                        
+                        self._debug_log(f"  ✓ ENCONTRADO: {occurrences} coincidencia(s)")
                         
                         self.results.append({
                             'file': str(file_path),
@@ -191,6 +316,10 @@ class DocumentSearcher:
                             'type': file_path.suffix,
                             'occurrences': occurrences
                         })
+                    else:
+                        self._debug_log(f"  ✗ No encontrado")
+                else:
+                    self._debug_log(f"  ⚠ No se pudo extraer texto")
                 
                 # Actualizar progreso
                 if callback:
@@ -199,9 +328,12 @@ class DocumentSearcher:
                     
             except Exception as e:
                 # Log del error pero continúa buscando
-                print(f"Error procesando {file_path}: {str(e)}")
+                error_msg = f"Error procesando {file_path}: {str(e)}"
+                print(error_msg)
+                self._debug_log(f"  ✗ ERROR: {str(e)}")
                 continue
         
+        self._debug_log(f"Búsqueda finalizada. Resultados: {len(self.results)}")
         return self.results
     
     def cancel_search(self):
@@ -253,7 +385,7 @@ class DocumentSearcher:
             elif extension in {'.html', '.htm', '.php'}:
                 return self._read_txt(file_path)  # Son archivos de texto plano
         except Exception as e:
-            print(f"Error extrayendo texto de {file_path}: {str(e)}")
+            self._debug_log(f"Error extrayendo texto: {str(e)}")
             
         return ""
     
@@ -295,31 +427,42 @@ class DocumentSearcher:
     
     def _read_pdf_with_ocr(self, file_path: Path) -> str:
         """
-        Lee documento PDF aplicando OCR si es necesario.
+        Lee documento PDF aplicando OCR.
+        Cuando OCR está activado, SIEMPRE usa OCR (ignora texto nativo).
         
         Args:
             file_path: Ruta al archivo PDF
             
         Returns:
-            Texto extraído (combinando texto nativo + OCR)
+            Texto extraído mediante OCR
         """
         if not OCR_AVAILABLE or not self.tesseract_path or not self.poppler_path:
-            # Si OCR no está disponible, usar método normal
+            self._debug_log("  ⚠ OCR no disponible, usando extracción normal")
             return self._read_pdf(file_path)
         
         try:
-            # Primero intentar extraer texto nativo
-            native_text = self._read_pdf(file_path)
+            # Cuando OCR está activado, aplicarlo directamente
+            # (PDFs escaneados pueden tener texto "fantasma" que confunde)
+            self._debug_log("  🔬 OCR ACTIVADO - Procesando con Tesseract...")
+            self._debug_log(f"  Tesseract: {self.tesseract_path}")
+            self._debug_log(f"  Poppler: {self.poppler_path}")
             
-            # Si hay suficiente texto nativo, usarlo
-            if len(native_text.strip()) > 100:
-                return native_text
+            ocr_text = self._extract_text_with_ocr(file_path)
             
-            # Si no hay texto o es muy poco, aplicar OCR
-            return self._extract_text_with_ocr(file_path)
+            if ocr_text and len(ocr_text.strip()) > 0:
+                self._debug_log(f"  ✓ OCR completado: {len(ocr_text)} caracteres extraídos")
+                # Mostrar preview del texto
+                preview = ocr_text[:200].replace('\n', ' ')
+                self._debug_log(f"  Preview: {preview}...")
+            else:
+                self._debug_log("  ✗ OCR no extrajo texto (documento vacío o error)")
+            
+            return ocr_text
             
         except Exception as e:
-            print(f"Error en OCR para {file_path}: {str(e)}")
+            self._debug_log(f"  ✗ ERROR en OCR: {str(e)}")
+            import traceback
+            self._debug_log(f"  Traceback: {traceback.format_exc()}")
             # Fallback al método normal
             return self._read_pdf(file_path)
     
@@ -334,25 +477,63 @@ class DocumentSearcher:
             Texto extraído mediante OCR
         """
         if not OCR_AVAILABLE:
+            self._debug_log("  ✗ Librerías OCR no disponibles")
             return ""
         
         try:
-            # Convertir PDF a imágenes
+            self._debug_log(f"  📄 Convirtiendo PDF a imágenes...")
+            self._debug_log(f"  Archivo: {file_path.name} ({file_path.stat().st_size} bytes)")
+            
+            # Convertir PDF a imágenes con alta calidad
             images = convert_from_path(
                 str(file_path),
-                poppler_path=self.poppler_path
+                poppler_path=self.poppler_path,
+                dpi=300,  # Alta resolución para mejor OCR
+                fmt='jpeg'
             )
+            
+            self._debug_log(f"  ✓ PDF convertido: {len(images)} página(s)")
             
             # Aplicar OCR a cada página
             text_parts = []
-            for image in images:
-                text = pytesseract.image_to_string(image, lang='spa+eng')
-                text_parts.append(text)
+            for i, image in enumerate(images, 1):
+                self._debug_log(f"  🔍 Página {i}/{len(images)}: Aplicando Tesseract OCR...")
+                self._debug_log(f"     Tamaño imagen: {image.size[0]}x{image.size[1]} px")
+                
+                try:
+                    # Aplicar OCR con configuración optimizada
+                    text = pytesseract.image_to_string(
+                        image, 
+                        lang='spa+eng',  # Español e inglés
+                        config='--psm 1 --oem 3'  # Mejor segmentación
+                    )
+                    
+                    text_length = len(text.strip())
+                    self._debug_log(f"  ✓ Página {i}: {text_length} caracteres extraídos")
+                    
+                    if text_length > 0:
+                        # Mostrar las primeras palabras extraídas
+                        preview = ' '.join(text.split()[:15])
+                        self._debug_log(f"     Preview: '{preview}...'")
+                        text_parts.append(text)
+                    else:
+                        self._debug_log(f"  ⚠ Página {i}: Sin texto detectado (página en blanco?)")
+                        
+                except Exception as e:
+                    self._debug_log(f"  ✗ Error OCR en página {i}: {str(e)}")
+                    continue
             
-            return '\n'.join(text_parts)
+            final_text = '\n\n'.join(text_parts)
+            total_chars = len(final_text)
+            self._debug_log(f"  📊 Total extraído: {total_chars} caracteres de {len(images)} página(s)")
+            
+            return final_text
             
         except Exception as e:
-            print(f"Error aplicando OCR: {str(e)}")
+            self._debug_log(f"  ✗ ERROR CRÍTICO en _extract_text_with_ocr: {str(e)}")
+            import traceback
+            error_trace = traceback.format_exc()
+            self._debug_log(f"  Traceback completo:\n{error_trace}")
             return ""
     
     def _read_excel(self, file_path: Path) -> str:
@@ -394,8 +575,10 @@ class DocumentSearcherGUI:
             root: Ventana principal de Tkinter
         """
         self.root = root
-        self.searcher = DocumentSearcher()
+        self.config_manager = ConfigManager()
+        self.searcher = DocumentSearcher(self.config_manager)
         self.search_thread = None
+        self.debug_window = None
         
         self._setup_window()
         self._create_widgets()
@@ -403,7 +586,7 @@ class DocumentSearcherGUI:
     
     def _setup_window(self):
         """Configura la ventana principal."""
-        self.root.title("🔍 Buscador de Documentos v2.0 (con OCR)")
+        self.root.title("🔍 Buscador de Documentos (con OCR)")
         self.root.geometry("950x750")
         self.root.minsize(850, 650)
         
@@ -462,7 +645,7 @@ class DocumentSearcherGUI:
         self.ocr_var = tk.BooleanVar()
         self.ocr_checkbox = ttk.Checkbutton(
             options_frame, 
-            text="🔬 Aplicar OCR (PDFs escaneados/imágenes)", 
+            text="🔬 Aplicar OCR (PDFs escaneados)", 
             variable=self.ocr_var,
             command=self._on_ocr_toggle
         )
@@ -471,6 +654,10 @@ class DocumentSearcherGUI:
         # Botón configurar OCR
         ttk.Button(options_frame, text="⚙️ Configurar OCR", 
                   command=self._configure_ocr).pack(side=tk.LEFT, padx=(5, 0))
+        
+        # Botón ver debug
+        ttk.Button(options_frame, text="🐛 Ver Debug", 
+                  command=self._show_debug_window).pack(side=tk.LEFT, padx=(5, 0))
         
         # --- Botones de acción ---
         button_frame = ttk.Frame(main_frame)
@@ -550,6 +737,40 @@ class DocumentSearcherGUI:
                  font=('Helvetica', 9)).grid(
             row=10, column=0, columnspan=3, sticky=tk.W, pady=(5, 0))
     
+    def _show_debug_window(self):
+        """Muestra ventana con mensajes de debug."""
+        if self.debug_window and tk.Toplevel.winfo_exists(self.debug_window):
+            self.debug_window.lift()
+            return
+        
+        self.debug_window = tk.Toplevel(self.root)
+        self.debug_window.title("🐛 Debug Log")
+        self.debug_window.geometry("700x500")
+        
+        frame = ttk.Frame(self.debug_window, padding=10)
+        frame.pack(fill=tk.BOTH, expand=True)
+        
+        ttk.Label(frame, text="Mensajes de Debug (útil para diagnosticar problemas)", 
+                 font=('Helvetica', 10, 'bold')).pack(pady=(0, 10))
+        
+        # Área de texto con scroll
+        self.debug_text = scrolledtext.ScrolledText(frame, wrap=tk.WORD, 
+                                                    height=20, width=80)
+        self.debug_text.pack(fill=tk.BOTH, expand=True)
+        
+        # Botón limpiar
+        ttk.Button(frame, text="Limpiar", 
+                  command=lambda: self.debug_text.delete(1.0, tk.END)).pack(pady=(10, 0))
+        
+        # Configurar callback de debug
+        self.searcher.debug_callback = self._add_debug_message
+    
+    def _add_debug_message(self, message: str):
+        """Añade mensaje a la ventana de debug."""
+        if self.debug_window and tk.Toplevel.winfo_exists(self.debug_window):
+            self.debug_text.insert(tk.END, message + "\n")
+            self.debug_text.see(tk.END)
+    
     def _check_dependencies(self):
         """Verifica y muestra advertencias sobre dependencias faltantes."""
         missing = []
@@ -569,18 +790,18 @@ class DocumentSearcherGUI:
             self.status_var.set("Advertencia: Algunas funcionalidades limitadas")
             messagebox.showwarning("Dependencias faltantes", warning_msg)
         
-        # Verificar OCR
+        # Verificar OCR y configuración guardada
         if not OCR_AVAILABLE:
             self.ocr_checkbox.config(state='disabled')
             self.status_var.set("OCR no disponible - Instala: pip install pytesseract pdf2image pillow")
-        elif not self.searcher.tesseract_path or not self.searcher.poppler_path:
-            self.ocr_checkbox.config(state='disabled')
-            missing_ocr = []
-            if not self.searcher.tesseract_path:
-                missing_ocr.append("Tesseract-OCR")
-            if not self.searcher.poppler_path:
-                missing_ocr.append("Poppler")
-            self.status_var.set(f"OCR requiere: {', '.join(missing_ocr)} - Click en 'Configurar OCR'")
+        else:
+            # Verificar si OCR está correctamente configurado
+            success, message = self.searcher.test_ocr_setup()
+            if success:
+                self.status_var.set(f"✓ {message}")
+            else:
+                self.ocr_checkbox.config(state='disabled')
+                self.status_var.set(f"OCR: {message} - Click en 'Configurar OCR'")
     
     def _on_ocr_toggle(self):
         """Maneja el evento de activar/desactivar OCR."""
@@ -594,11 +815,12 @@ class DocumentSearcherGUI:
                 self.ocr_var.set(False)
                 return
             
-            if not self.searcher.tesseract_path or not self.searcher.poppler_path:
+            success, message = self.searcher.test_ocr_setup()
+            if not success:
                 messagebox.showwarning(
                     "Configuración OCR incompleta",
-                    "Por favor configura las rutas de Tesseract y Poppler\n"
-                    "usando el botón 'Configurar OCR'"
+                    f"{message}\n\n"
+                    "Por favor configura las rutas usando el botón 'Configurar OCR'"
                 )
                 self.ocr_var.set(False)
                 return
@@ -609,6 +831,8 @@ class DocumentSearcherGUI:
                 "⚠️ IMPORTANTE:\n\n"
                 "El OCR hace la búsqueda MUCHO MÁS LENTA,\n"
                 "especialmente con PDFs grandes.\n\n"
+                "Se recomienda abrir la ventana 'Ver Debug'\n"
+                "para seguir el progreso del OCR.\n\n"
                 "¿Continuar con OCR activado?",
                 icon='warning'
             )
@@ -617,90 +841,98 @@ class DocumentSearcherGUI:
                 self.ocr_var.set(False)
     
     def _configure_ocr(self):
-        """Abre ventana de configuración de OCR."""
+        """Abre ventana de configuración de OCR sin scroll innecesario."""
         config_window = tk.Toplevel(self.root)
         config_window.title("⚙️ Configuración OCR")
-        config_window.geometry("600x400")
         config_window.transient(self.root)
         config_window.grab_set()
-        
+
+        # Frame principal
         frame = ttk.Frame(config_window, padding=20)
         frame.pack(fill=tk.BOTH, expand=True)
-        
+
         # Instrucciones
-        ttk.Label(frame, text="Configuración de OCR", 
-                 font=('Helvetica', 12, 'bold')).pack(pady=(0, 10))
-        
+        ttk.Label(frame, text="Configuración de OCR", font=('Helvetica', 12, 'bold')).pack(pady=(0, 10))
         info_text = (
             "Para usar OCR necesitas instalar:\n\n"
-            "1. Tesseract-OCR:\n"
-            "   https://github.com/UB-Mannheim/tesseract/wiki\n\n"
-            "2. Poppler para Windows:\n"
-            "   https://github.com/oschwartz10612/poppler-windows/releases\n\n"
-            "3. Librerías Python:\n"
-            "   pip install pytesseract pdf2image pillow"
+            "1. Tesseract-OCR: https://github.com/UB-Mannheim/tesseract/wiki\n"
+            "2. Poppler para Windows: https://github.com/oschwartz10612/poppler-windows/releases\n"
+            "3. Librerías Python: pip install pytesseract pdf2image pillow\n\n"
+            "La configuración se guardará automáticamente."
         )
-        
-        info_label = ttk.Label(frame, text=info_text, justify=tk.LEFT)
-        info_label.pack(pady=(0, 20))
-        
-        # Tesseract Path
-        ttk.Label(frame, text="Ruta de Tesseract:").pack(anchor=tk.W)
+        ttk.Label(frame, text=info_text, justify=tk.LEFT, foreground=self.COLOR_PRIMARY).pack(pady=(0, 20))
+
+        # Tesseract
+        ttk.Label(frame, text="Ruta de Tesseract (tesseract.exe):", font=('Helvetica', 9, 'bold')).pack(anchor=tk.W)
         tesseract_frame = ttk.Frame(frame)
         tesseract_frame.pack(fill=tk.X, pady=(5, 15))
-        
         tesseract_var = tk.StringVar(value=self.searcher.tesseract_path or "")
-        tesseract_entry = ttk.Entry(tesseract_frame, textvariable=tesseract_var)
-        tesseract_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-        
+        ttk.Entry(tesseract_frame, textvariable=tesseract_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+
         def browse_tesseract():
-            path = filedialog.askopenfilename(
-                title="Seleccionar tesseract.exe",
-                filetypes=[("Ejecutable", "*.exe"), ("Todos", "*.*")]
-            )
+            path = filedialog.askopenfilename(title="Seleccionar tesseract.exe", filetypes=[("Ejecutable", "*.exe"), ("Todos", "*.*")])
             if path:
                 tesseract_var.set(path)
-        
-        ttk.Button(tesseract_frame, text="Buscar...", 
-                  command=browse_tesseract).pack(side=tk.LEFT)
-        
-        # Poppler Path
-        ttk.Label(frame, text="Ruta del directorio bin de Poppler:").pack(anchor=tk.W)
+
+        ttk.Button(tesseract_frame, text="Buscar...", command=browse_tesseract).pack(side=tk.LEFT)
+
+        tesseract_status_var = tk.StringVar()
+        ttk.Label(frame, textvariable=tesseract_status_var, foreground=self.COLOR_SECONDARY).pack(anchor=tk.W, pady=(0, 10))
+        if tesseract_var.get() and os.path.exists(tesseract_var.get()):
+            tesseract_status_var.set("✓ Tesseract encontrado")
+
+        # Poppler
+        ttk.Label(frame, text="Ruta del directorio bin de Poppler:", font=('Helvetica', 9, 'bold')).pack(anchor=tk.W)
+        ttk.Label(frame, text="Ejemplo: C:\\poppler\\Library\\bin", foreground="gray").pack(anchor=tk.W, pady=(0, 5))
         poppler_frame = ttk.Frame(frame)
-        poppler_frame.pack(fill=tk.X, pady=(5, 20))
-        
+        poppler_frame.pack(fill=tk.X, pady=(5, 15))
         poppler_var = tk.StringVar(value=self.searcher.poppler_path or "")
-        poppler_entry = ttk.Entry(poppler_frame, textvariable=poppler_var)
-        poppler_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-        
+        ttk.Entry(poppler_frame, textvariable=poppler_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+
         def browse_poppler():
             path = filedialog.askdirectory(title="Seleccionar carpeta bin de Poppler")
             if path:
                 poppler_var.set(path)
-        
-        ttk.Button(poppler_frame, text="Buscar...", 
-                  command=browse_poppler).pack(side=tk.LEFT)
-        
-        # Botones
-        button_frame = ttk.Frame(frame)
-        button_frame.pack(pady=(10, 0))
-        
+
+        ttk.Button(poppler_frame, text="Buscar...", command=browse_poppler).pack(side=tk.LEFT)
+
+        poppler_status_var = tk.StringVar()
+        ttk.Label(frame, textvariable=poppler_status_var, foreground=self.COLOR_SECONDARY).pack(anchor=tk.W, pady=(0, 20))
+        if poppler_var.get() and os.path.exists(poppler_var.get()):
+            poppler_status_var.set("✓ Poppler encontrado")
+
+        def test_config():
+            t_ok = tesseract_var.get() and os.path.exists(tesseract_var.get())
+            p_ok = poppler_var.get() and os.path.exists(poppler_var.get())
+            tesseract_status_var.set("✓ Tesseract válido" if t_ok else "✗ Ruta de Tesseract inválida")
+            poppler_status_var.set("✓ Poppler válido" if p_ok else "✗ Ruta de Poppler inválida")
+
+        ttk.Button(frame, text="🔍 Probar configuración", command=test_config).pack(pady=(0, 20))
+
         def save_config():
-            tesseract_ok = self.searcher.set_tesseract_path(tesseract_var.get())
-            poppler_ok = self.searcher.set_poppler_path(poppler_var.get())
-            
-            if tesseract_ok and poppler_ok:
-                messagebox.showinfo("Éxito", "Configuración guardada correctamente")
+            t_ok = self.searcher.set_tesseract_path(tesseract_var.get())
+            p_ok = self.searcher.set_poppler_path(poppler_var.get())
+            if t_ok and p_ok:
+                messagebox.showinfo("Éxito", "✓ Configuración guardada correctamente")
                 self.ocr_checkbox.config(state='normal')
-                self.status_var.set("OCR configurado y listo para usar")
+                success, msg = self.searcher.test_ocr_setup()
+                self.status_var.set(msg)
                 config_window.destroy()
             else:
-                messagebox.showerror("Error", "Las rutas especificadas no son válidas")
-        
-        ttk.Button(button_frame, text="Guardar", 
-                  command=save_config).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="Cancelar", 
-                  command=config_window.destroy).pack(side=tk.LEFT, padx=5)
+                errors = []
+                if not t_ok: errors.append("• Tesseract: ruta inválida")
+                if not p_ok: errors.append("• Poppler: ruta inválida")
+                messagebox.showerror("Error", "Las rutas no son válidas:\n\n" + "\n".join(errors))
+
+        button_frame = ttk.Frame(frame)
+        button_frame.pack(pady=(10, 0))
+        ttk.Button(button_frame, text="💾 Guardar", command=save_config).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="✖ Cancelar", command=config_window.destroy).pack(side=tk.LEFT, padx=5)
+
+        # Ajustar tamaño automáticamente
+        config_window.update_idletasks()
+        config_window.geometry(f"{config_window.winfo_reqwidth()}x{config_window.winfo_reqheight()}")
+
     
     def _select_directory(self):
         """Abre diálogo para seleccionar directorio."""
@@ -727,6 +959,10 @@ class DocumentSearcherGUI:
         
         # Limpiar resultados anteriores
         self._clear_results()
+        
+        # Limpiar debug si existe
+        if self.debug_window and tk.Toplevel.winfo_exists(self.debug_window):
+            self.debug_text.delete(1.0, tk.END)
         
         # Deshabilitar botón de búsqueda, habilitar cancelar
         self.search_button.config(state='disabled')
@@ -764,8 +1000,10 @@ class DocumentSearcherGUI:
             self.root.after(0, self._display_results, results)
             
         except Exception as e:
+            import traceback
+            error_detail = traceback.format_exc()
             self.root.after(0, messagebox.showerror, 
-                          "Error", f"Error durante la búsqueda:\n{str(e)}")
+                          "Error", f"Error durante la búsqueda:\n{str(e)}\n\n{error_detail}")
         finally:
             self.root.after(0, self._search_completed)
     
@@ -780,7 +1018,7 @@ class DocumentSearcherGUI:
         self.root.after(0, self.progress_var.set, progress)
         status_text = f"Buscando... ({progress:.0f}%) - {current_file}"
         if self.ocr_var.get():
-            status_text += " [OCR activado - puede ser lento]"
+            status_text += " [OCR activado]"
         self.root.after(0, self.status_var.set, status_text)
     
     def _display_results(self, results: List[Dict]):
@@ -869,4 +1107,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
